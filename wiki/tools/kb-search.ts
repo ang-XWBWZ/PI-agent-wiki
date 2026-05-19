@@ -108,7 +108,7 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
             }
           }
         } else {
-          const hint = `💡 展开以查看 ${d.results.length} 篇完整内容（共 ${d.hits} 条匹配）`;
+          const hint = `💡 Ctrl+O 展开查看 ${d.results.length} 篇完整内容（共 ${d.hits} 条匹配）`;
           container.addChild(new Text(theme.fg("dim", hint), 0, 0));
         }
       }

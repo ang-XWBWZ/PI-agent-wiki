@@ -10,8 +10,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cmdLoad, cmdUnload, cmdStatus } from "./wiki/commands/repo-cmds.js";
 import { cmdSearch, cmdAsk, cmdClose } from "./wiki/commands/query-cmds.js";
 import { registerKbSearchTool } from "./wiki/tools/kb-search.js";
+import { registerManagementTools } from "./wiki/tools/management.js";
 
 export default function (pi: ExtensionAPI) {
+  // AI 管理工具（8 个）
+  registerManagementTools(pi);
+
+  // kb_search 只读工具
   registerKbSearchTool(pi);
 
   pi.registerCommand("wiki-load", {
