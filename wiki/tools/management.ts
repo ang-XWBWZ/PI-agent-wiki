@@ -16,13 +16,19 @@ import {
   renameSync, statSync, readdirSync,
 } from "node:fs";
 import { resolve, relative, dirname, basename, extname } from "node:path";
+import { execSync } from "node:child_process";
 import { Container, Text, Spacer } from "@earendil-works/pi-tui";
 import {
   getSources, addSource, removeSource, mergeIndex,
   getIndex, removeEntry, updateEntryPath, getEntry, stats,
+  getSemanticEnabled, setSemanticEnabled, getEmbeddings,
 } from "../lib/store.js";
-import { scanDir } from "../lib/indexer.js";
+import { scanDir, generateEmbeddings, embedSingleFile } from "../lib/indexer.js";
 import { search } from "../lib/search.js";
+import {
+  initialize, isAvailable, getModelName, getInitError,
+  getLocalModelInfo, getModelSource, isDependencyInstalled,
+} from "../lib/embedder.js";
 import type { FileEntry } from "../lib/types.js";
 
 // ============================================================
@@ -133,9 +139,14 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       if (!addSource(abs)) return { content: [{ type: "text", text: `⚠️ 已加载: ${abs}` }] };
       const entries = await scanDir(abs);
       mergeIndex(entries);
+      // 语义搜索：生成向量
+      const embCount = await generateEmbeddings(abs, entries);
+      const semHint = embCount > 0
+        ? `\n🧠 已生成 ${embCount} 条语义向量`
+        : getSemanticEnabled() ? "" : "\n💡 语义搜索未启用。对我说「启用 wiki 语义搜索」即可自动配置。";
       return {
-        content: [{ type: "text", text: `✅ 已加载并索引 ${entries.length} 篇\n📂 ${abs}` }],
-        details: { source: abs, indexed: entries.length },
+        content: [{ type: "text", text: `✅ 已加载并索引 ${entries.length} 篇${semHint}\n📂 ${abs}` }],
+        details: { source: abs, indexed: entries.length, embeddings: embCount },
       };
     },
   });
@@ -213,14 +224,19 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       }
 
       let total = 0;
+      let embTotal = 0;
       for (const src of sources) {
         const entries = await scanDir(src);
         mergeIndex(entries);
         total += entries.length;
+        // 语义搜索：增量生成向量
+        const embCount = await generateEmbeddings(src, entries);
+        embTotal += embCount;
       }
+      const embHint = embTotal > 0 ? `，${embTotal} 条向量更新` : "";
       return {
-        content: [{ type: "text", text: `🔄 已刷新 ${sources.length} 个数据源，共索引 ${total} 篇` }],
-        details: { sources: sources.length, indexed: total },
+        content: [{ type: "text", text: `🔄 已刷新 ${sources.length} 个数据源，共索引 ${total} 篇${embHint}` }],
+        details: { sources: sources.length, indexed: total, embeddings: embTotal },
       };
     },
   });
@@ -280,6 +296,9 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       // 索引新条目
       const entry = extractSingle(src, fullPath);
       if (entry) mergeIndex([entry]);
+
+      // 语义搜索：为新文件生成向量
+      embedSingleFile(src, p, title).catch(() => { /* 非关键路径 */ });
 
       return {
         content: [{ type: "text", text: `✅ 已创建: ${p}\n📄 ${title}${tags.length ? ` 标签: [${tags.join(", ")}]` : ""}` }],
@@ -598,6 +617,170 @@ export function registerManagementTools(pi: ExtensionAPI): void {
         content: [{ type: "text", text: `✅ ${type}已移动: ${fromRel} → ${targetPath}` }],
         details: { source: src, from: fromRel, to: targetPath, isDir },
       };
+    },
+  });
+
+  // ---- 语义搜索管理 ----
+
+  pi.registerTool({
+    name: "wiki_enable_semantic",
+    label: "Wiki Enable Semantic",
+    description:
+      "启用语义搜索。可选自动安装 @huggingface/transformers 依赖。启用后自动为所有已索引文件生成语义向量。",
+    promptSnippet: "Enable semantic search for wiki",
+    promptGuidelines: [
+      "Call this when the user wants to enable semantic search.",
+      "Set autoInstall: true to auto-trigger npm install to wiki/node_modules/",
+      "",
+      "📦 依赖: @huggingface/transformers（transformers.js）",
+      "   安装: npm install @huggingface/transformers（安装至 extensions/wiki/node_modules/）",
+      "   体积: ~500MB（含 ONNX runtime 原生二进制）",
+      "",
+      "🧠 模型: Xenova/paraphrase-multilingual-MiniLM-L12-v2（多语言 384 维）",
+      "   来源: HuggingFace Hub → https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+      "   镜像: https://hf-mirror.com/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/",
+      "   精度: INT8 量化 ~118MB（推荐） ｜ FP32 全精度 ~470MB",
+      "   文件: config.json · tokenizer.json · tokenizer_config.json · onnx/model_quantized.onnx",
+      "   本地: wiki/models/paraphrase-multilingual-MiniLM-L12-v2/（存在即优先离线加载）",
+      "",
+      "🔧 一键初始化（网络受限时）:",
+      "   分两步初始化（三平台通用）:",
+      "     ① npm 依赖: init-wiki-deps.bat / .ps1 / .sh",
+      "     ② 模型下载: init-wiki-model.bat / .ps1 / .sh",
+      "",
+      "⚠️ 常见坑:",
+      "   ① embedder.ts 的 model_file_name 只需主干名 \"model_quantized\"，",
+      "      transformers.js 自动补 onnx/ + .onnx，勿写完整路径",
+      "   ② 部署 robocopy 加 /XD wiki\\models 避免覆盖已下载的模型",
+      "   ③ 启用前确保 wiki_load_source 已加载数据源",
+      "",
+      "This will re-index all sources to generate embeddings.",
+      "Use wiki_semantic_status to check progress/results.",
+    ],
+    parameters: Type.Object({
+      autoInstall: Type.Optional(Type.Boolean({ description: "是否自动安装 @huggingface/transformers（默认 true）" })),
+    }),
+    async execute(_tcid, params, signal) {
+      if (signal?.aborted) throw new Error("aborted");
+      const doInstall = params.autoInstall !== false;
+
+      // 先尝试初始化，如果依赖未安装则自动处理
+      let ok = await initialize();
+      if (!ok) {
+        const err = getInitError() || "";
+        const isMissingDep = err.includes("Cannot find module")
+          || err.includes("Failed to resolve")
+          || err.includes("Module not found");
+
+        if (!isMissingDep) {
+          // 非依赖缺失错误（如网络问题），直接报告
+          return { content: [{ type: "text", text: `❌ 初始化失败: ${err}` }] };
+        }
+
+        if (!doInstall) {
+          return { content: [{ type: "text", text: `❌ 语义搜索依赖 @huggingface/transformers 未安装。\n设置 autoInstall: true 自动安装，或手动运行:\n  npm install @huggingface/transformers` }] };
+        }
+
+        // 自动安装依赖到 wiki 本地 node_modules/，Node.js 原生 import 即可找到
+        const wikiDir = resolve(__dirname, "..");
+        try {
+          execSync(
+            `npm install @huggingface/transformers`,
+            { encoding: "utf-8", timeout: 180_000, cwd: wikiDir },
+          );
+        } catch (e: any) {
+          return {
+            content: [{ type: "text", text: `❌ 安装失败: ${e?.stderr || e?.message || String(e)}\n\n请手动运行:\n  cd extensions\\wiki && npm install @huggingface/transformers` }],
+          };
+        }
+
+        // 安装后重试初始化
+        ok = await initialize();
+        if (!ok) {
+          return { content: [{ type: "text", text: `❌ 初始化 embedder 失败: ${getInitError() || "未知错误"}` }] };
+        }
+      }
+
+      // 启用
+      setSemanticEnabled(true);
+
+      // 为所有数据源生成 embedding
+      const sources = getSources();
+      let total = 0;
+      for (const src of sources) {
+        const entries = Object.values(getIndex()).filter(e => e.sourceDir === src);
+        const count = await generateEmbeddings(src, entries);
+        total += count;
+      }
+
+      return {
+        content: [{ type: "text", text: `✅ 语义搜索已启用\n🧠 模型: ${getModelName()}\n📊 已为 ${total} 篇文档生成语义向量` }],
+        details: { enabled: true, model: getModelName(), embeddings: total },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "wiki_disable_semantic",
+    label: "Wiki Disable Semantic",
+    description: "关闭语义搜索（保留已生成的向量数据，下次启用时无需重新生成）。",
+    promptSnippet: "Disable semantic search for wiki",
+    promptGuidelines: [
+      "Call when user wants to disable semantic search.",
+      "Embeddings are preserved — re-enabling won't require regeneration.",
+      "Keyword search remains fully functional.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_tcid, _params, signal) {
+      if (signal?.aborted) throw new Error("aborted");
+      if (!getSemanticEnabled()) {
+        return { content: [{ type: "text", text: "⚠️ 语义搜索未启用" }] };
+      }
+      setSemanticEnabled(false);
+      const embCount = Object.keys(getEmbeddings()).length;
+      return {
+        content: [{ type: "text", text: `🔒 语义搜索已关闭（${embCount} 条向量保留，重新启用时无需重新生成）` }],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "wiki_semantic_status",
+    label: "Wiki Semantic Status",
+    description: "查看语义搜索状态：是否启用、依赖是否安装、向量数量、模型名。",
+    promptSnippet: "Check semantic search status",
+    promptGuidelines: [
+      "Call to check if semantic search is set up correctly.",
+      "Returns enabled state, dependency status, embedding count, model name.",
+      "If not enabled, suggest wiki_enable_semantic to set up.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_tcid, _params, signal) {
+      if (signal?.aborted) throw new Error("aborted");
+      const enabled = getSemanticEnabled();
+      const embCount = Object.keys(getEmbeddings()).length;
+      const depReady = isAvailable();
+      const depInstalled = await isDependencyInstalled();
+      const model = getModelName();
+      const modelSrc = isAvailable() ? getModelSource() : "未加载";
+      const localInfo = getLocalModelInfo();
+
+      const lines = [
+        `🧠 语义搜索状态`,
+        `   状态: ${enabled ? "✅ 已启用" : "⏸ 未启用"}`,
+        `   依赖: ${depInstalled ? (depReady ? "✅ 已就绪" : "⏳ 已安装但未加载") : "❌ 未安装 @huggingface/transformers"}`,
+        `   模型: ${model}`,
+        `   来源: ${modelSrc}`,
+      ];
+      if (localInfo) {
+        lines.push(`   精度: ${localInfo.variant.toUpperCase()} (${localInfo.onnxSize > 0 ? (localInfo.onnxSize / 1_000_000).toFixed(0) + " MB" : "未知"})`);
+      }
+      lines.push(`   向量: ${embCount} 条`);
+      if (!enabled) {
+        lines.push("", "💡 对我说『启用 wiki 语义搜索』即可自动配置。");
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   });
 }
